@@ -1,2 +1,3 @@
 # build directory (CMake)
 build/
+.cache/
