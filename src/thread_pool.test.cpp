@@ -11,13 +11,13 @@
 using namespace std::chrono_literals;
 
 TEST_CASE("threadpool executes submitted void tasks", "[threadpool]") {
-  threadpool pool(4);
+  ThreadPool pool(4);
 
   std::atomic<int> counter{0};
   constexpr int N = 200;
 
   for (int i = 0; i < N; ++i) {
-    pool.commit(
+    pool.submit(
         [&counter] { counter.fetch_add(1, std::memory_order_relaxed); });
   }
 
@@ -32,24 +32,24 @@ TEST_CASE("threadpool executes submitted void tasks", "[threadpool]") {
 
 TEST_CASE("threadpool commit returns future with correct value",
           "[threadpool]") {
-  threadpool pool(2);
+  ThreadPool pool(2);
 
-  auto f1 = pool.commit([] { return 42; });
-  auto f2 = pool.commit([](int a, int b) { return a + b; }, 10, 32);
+  auto f1 = pool.submit([] { return 42; });
+  auto f2 = pool.submit([](int a, int b) { return a + b; }, 10, 32);
 
   REQUIRE(f1.get() == 42);
   REQUIRE(f2.get() == 42);
 }
 
 TEST_CASE("threadpool handles many futures correctly", "[threadpool]") {
-  threadpool pool(4);
+  ThreadPool pool(4);
 
   constexpr int N = 100;
   std::vector<std::future<int>> futs;
   futs.reserve(N);
 
   for (int i = 0; i < N; ++i) {
-    futs.emplace_back(pool.commit([i] {
+    futs.emplace_back(pool.submit([i] {
       std::this_thread::sleep_for(1ms);
       return i * i;
     }));
@@ -67,9 +67,9 @@ TEST_CASE("threadpool handles many futures correctly", "[threadpool]") {
 TEST_CASE("threadpool destructor does not deadlock with pending tasks",
           "[threadpool]") {
   REQUIRE_NOTHROW([] {
-    threadpool pool(4);
+    ThreadPool pool(4);
     for (int i = 0; i < 200; ++i) {
-      pool.commit([] { std::this_thread::sleep_for(2ms); });
+      pool.submit([] { std::this_thread::sleep_for(2ms); });
     }
   }());
 }

@@ -2,8 +2,9 @@
 #ifndef THREAD_POOL_H
 #define THREAD_POOL_H
 
-#include <atomic>
+#include <algorithm>
 #include <condition_variable>
+#include <exception>
 #include <functional>
 #include <future>
 #include <memory>
@@ -11,131 +12,135 @@
 #include <queue>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
-// 线程池最大容量,应尽量设小一点
-#define THREADPOOL_MAX_NUM 16
-// 线程池是否可以自动增长(如果需要,且不超过 THREADPOOL_MAX_NUM)
-// #define THREADPOOL_AUTO_GROW
-
-class threadpool {
-  unsigned short _initSize;
-  using Task = std::function<void()>;
-
-  std::vector<std::thread> _pool;
-  std::queue<Task> _tasks;
-
-  std::mutex _lock;
-#ifdef THREADPOOL_AUTO_GROW
-  std::mutex _lockGrow;
-#endif
-  std::condition_variable _task_cv;
-
-  std::atomic<bool> _run{true};
-  std::atomic<int> _idlThrNum{0};
+class ThreadPool {
+  static constexpr std::size_t kMaxThreads = 16;
 
 public:
-  explicit threadpool(unsigned short size = 4) : _initSize(size) {
-    addThread(size);
+  using Task = std::function<void()>;
+
+  explicit ThreadPool(std::size_t thread_count = 4) : stop_(false) {
+    thread_count = std::clamp<std::size_t>(thread_count, 1, kMaxThreads);
+    start_workers(thread_count);
   }
 
-  ~threadpool() {
-    _run = false;
-    _task_cv.notify_all();
-    for (std::thread &t : _pool) {
-      if (t.joinable())
+  ~ThreadPool() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    for (auto &t : workers_) {
+      if (t.joinable()) {
         t.join();
-    }
-  }
-
-  template <class F, class... Args>
-  auto commit(F &&f, Args &&...args) -> std::future<decltype(f(args...))> {
-    if (!_run) {
-      throw std::runtime_error("commit on ThreadPool is stopped.");
-    }
-
-    using RetType = decltype(f(args...));
-
-    // packaged_task + future
-
-    auto task = std::make_shared<std::packaged_task<RetType()>>(
-        std::bind(std::forward<F>(f), std::forward<Args>(args)...));
-
-    std::future<RetType> fut = task->get_future();
-    {
-      std::lock_guard<std::mutex> lock(_lock);
-      _tasks.emplace([task]() { (*task)(); });
-    }
-
-#ifdef THREADPOOL_AUTO_GROW
-    if (_idlThrNum < 1 && _pool.size() < THREADPOOL_MAX_NUM)
-      addThread(1);
-#endif
-    _task_cv.notify_one();
-    return fut;
-  }
-
-  template <class F> void commit2(F &&task) {
-    if (!_run)
-      return;
-    {
-      std::lock_guard<std::mutex> lock(_lock);
-      _tasks.emplace(std::forward<F>(task));
-    }
-#ifdef THREADPOOL_AUTO_GROW
-    if (_idlThrNum < 1 && _pool.size() < THREADPOOL_MAX_NUM)
-      addThread(1);
-#endif
-    _task_cv.notify_one();
-  }
-
-  int idlCount() { return _idlThrNum; }
-  int thrCount() { return static_cast<int>(_pool.size()); }
-
-#ifndef THREADPOOL_AUTO_GROW
-private:
-#endif
-  void addThread(unsigned short size) {
-#ifdef THREADPOOL_AUTO_GROW
-    if (!_run)
-      throw std::runtime_error("Grow on ThreadPool is stopped.");
-    std::unique_lock<std::mutex> lockGrow(_lockGrow);
-#endif
-    for (; _pool.size() < THREADPOOL_MAX_NUM && size > 0; --size) {
-      _pool.emplace_back([this] {
-        while (true) {
-          Task task;
-          {
-            std::unique_lock<std::mutex> lock(_lock);
-            _task_cv.wait(lock, [this] { return !_run || !_tasks.empty(); });
-            if (!_run && _tasks.empty())
-              return;
-
-            _idlThrNum--;
-            task = std::move(_tasks.front());
-            _tasks.pop();
-          }
-
-          task();
-
-#ifdef THREADPOOL_AUTO_GROW
-          if (_idlThrNum > 0 && _pool.size() > _initSize)
-            return;
-#endif
-          {
-            std::unique_lock<std::mutex> lock(_lock);
-            _idlThrNum++;
-          }
-        }
-      });
-
-      {
-        std::unique_lock<std::mutex> lock(_lock);
-        _idlThrNum++;
       }
     }
   }
+
+  ThreadPool(const ThreadPool &) = delete;
+  ThreadPool &operator=(const ThreadPool &) = delete;
+
+  void setExceptionHandler(std::function<void(std::exception_ptr)> handler) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stop_)
+      return; // 或 throw
+    on_exception_ = std::move(handler);
+  }
+
+  // submit: 返回 future 的任务提交
+  template <typename F, typename... Args>
+  auto submit(F &&f, Args &&...args)
+      -> std::future<std::invoke_result_t<F, Args...>> {
+    using RetType = std::invoke_result_t<F, Args...>;
+
+    auto task = std::make_shared<std::packaged_task<RetType()>>(
+        [func = std::forward<F>(f), tup = std::make_tuple(std::forward<Args>(
+                                        args)...)]() mutable -> RetType {
+          return std::apply(std::move(func), std::move(tup));
+        });
+
+    std::future<RetType> fut = task->get_future();
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stop_) {
+        throw std::runtime_error("submit on ThreadPool is stopped.");
+      }
+      tasks_.emplace([task]() { (*task)(); });
+    }
+
+    cv_.notify_one();
+    return fut;
+  }
+
+  // post: fire-and-forget 提交
+  template <typename F> bool post(F &&task) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stop_) {
+        return false;
+      }
+      tasks_.emplace(std::forward<F>(task));
+    }
+    cv_.notify_one();
+    return true;
+  }
+
+  int threadCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return static_cast<int>(workers_.size());
+  }
+
+private:
+  void start_workers(std::size_t count) {
+    while (workers_.size() < kMaxThreads && count-- > 0) {
+      workers_.emplace_back([this] {
+        for (;;) {
+          Task task;
+
+          {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
+
+            if (stop_ && tasks_.empty()) {
+              return;
+            }
+
+            task = std::move(tasks_.front());
+            tasks_.pop();
+          }
+
+          // 执行任务（锁外）+ 异常保护
+          try {
+            task();
+          } catch (...) {
+            // 取 handler 的快照，避免在无锁状态下访问成员造成竞态
+            std::function<void(std::exception_ptr)> handler;
+            {
+              std::lock_guard<std::mutex> lock(mutex_);
+              handler = on_exception_;
+            }
+            if (handler)
+              handler(std::current_exception());
+            // 没 handler 就吞掉异常，保证 worker 不崩
+          }
+        }
+      });
+    }
+  }
+
+private:
+  std::vector<std::thread> workers_;
+  std::queue<Task> tasks_;
+  mutable std::mutex mutex_;
+  std::condition_variable cv_;
+  bool stop_{false};
+
+  std::function<void(std::exception_ptr)> on_exception_;
 };
 
 #endif // THREAD_POOL_H
