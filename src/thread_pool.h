@@ -1,7 +1,4 @@
 #pragma once
-#ifndef THREAD_POOL_H
-#define THREAD_POOL_H
-
 #include <algorithm>
 #include <condition_variable>
 #include <exception>
@@ -142,5 +139,3 @@ private:
 
   std::function<void(std::exception_ptr)> on_exception_;
 };
-
-#endif // THREAD_POOL_H
